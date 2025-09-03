@@ -1,0 +1,37 @@
+"""
+Alternative implementation using Celery for background processing
+Uncomment and configure if you prefer Celery over FastAPI BackgroundTasks
+"""
+
+from celery import Celery
+import os
+from dotenv import load_dotenv
+
+load_dotenv()
+
+# Initialize Celery
+celery_app = Celery(
+    'image_processor',
+    broker=os.getenv('REDIS_URL', 'redis://localhost:6379'),
+    backend=os.getenv('REDIS_URL', 'redis://localhost:6379')
+)
+
+celery_app.conf.update(
+    task_serializer='json',
+    accept_content=['json'],
+    result_serializer='json',
+    timezone='UTC',
+    enable_utc=True,
+)
+
+@celery_app.task
+def process_csv_task(request_id: str, file_path: str):
+    """Celery task for processing CSV files"""
+    import asyncio
+    
+    # Import the async processing function
+    from app.main import process_csv_async
+    
+    # Run the async processing function
+    loop = asyncio.get_event_loop()
+    loop.run_until_complete(process_csv_async(request_id, file_path))

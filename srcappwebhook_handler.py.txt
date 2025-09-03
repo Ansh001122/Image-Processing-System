@@ -1,0 +1,53 @@
+import aiohttp
+import logging
+import os
+from typing import Dict, Any
+
+logger = logging.getLogger(__name__)
+
+class WebhookHandler:
+    """Service to handle webhook notifications"""
+   
+    def __init__(self):
+        self.webhook_url = os.getenv("WEBHOOK_URL")
+   
+    async def trigger_webhook(self, payload: Dict[str, Any]):
+        """
+        Trigger webhook notification after processing completion
+       
+        Args:
+            payload: Data to send to webhook endpoint
+        """
+        if not self.webhook_url:
+            logger.info("No webhook URL configured, skipping webhook notification")
+            return
+       
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.post(
+                    self.webhook_url,
+                    json=payload,
+                    timeout=30
+                ) as response:
+                    if response.status == 200:
+                        logger.info(f"Webhook notification sent successfully for request {payload.get('request_id')}")
+                    else:
+                        logger.error(f"Webhook notification failed with status {response.status}")
+                       
+        except Exception as e:
+            logger.error(f"Error sending webhook notification: {str(e)}")
+   
+    async def handle_webhook(self, payload: Dict[str, Any]):
+        """
+        Handle incoming webhook notifications
+       
+        Args:
+            payload: Webhook payload data
+        """
+        logger.info(f"Received webhook notification: {payload}")
+       
+        # Process webhook payload as needed
+        # This could trigger additional actions like sending emails,
+        # updating external systems, etc.
+       
+        return {"status": "processed"}

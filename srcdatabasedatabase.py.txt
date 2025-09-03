@@ -1,0 +1,45 @@
+import sqlalchemy
+from sqlalchemy import create_engine, MetaData, Table, Column, String, Integer, DateTime, Text
+from databases import Database
+import os
+from dotenv import load_dotenv
+
+load_dotenv()
+
+DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://username:password@localhost/imageprocessing")
+
+database = Database(DATABASE_URL)
+metadata = MetaData()
+
+# Requests table to track processing status
+requests_table = Table(
+    "requests",
+    metadata,
+    Column("id", Integer, primary_key=True, autoincrement=True),
+    Column("request_id", String(36), unique=True, index=True),
+    Column("filename", String(255)),
+    Column("status", String(20)),
+    Column("total_images", Integer, default=0),
+    Column("processed_images", Integer, default=0),
+    Column("file_path", String(500)),
+    Column("output_csv_path", String(500)),
+    Column("error_message", Text),
+    Column("created_at", DateTime),
+    Column("updated_at", DateTime),
+)
+
+# Products table to store individual product processing results
+products_table = Table(
+    "products",
+    metadata,
+    Column("id", Integer, primary_key=True, autoincrement=True),
+    Column("request_id", String(36), index=True),
+    Column("serial_number", Integer),
+    Column("product_name", String(255)),
+    Column("input_urls", Text),
+    Column("output_urls", Text),
+)
+
+# Create engine for table creation
+engine = create_engine(DATABASE_URL)
+metadata.create_all(engine)

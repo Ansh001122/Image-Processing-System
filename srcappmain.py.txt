@@ -1,0 +1,330 @@
+from fastapi import FastAPI, File, UploadFile, HTTPException, BackgroundTasks
+from fastapi.responses import JSONResponse
+from fastapi.middleware.cors import CORSMiddleware
+import pandas as pd
+import uuid
+import os
+from datetime import datetime
+from typing import List, Optional
+import asyncio
+import aiofiles
+from database.database import database, requests_table, products_table
+from app.models import ProcessingStatus, RequestResponse, StatusResponse
+from app.image_processor import ImageProcessor
+from app.webhook_handler import WebhookHandler
+import logging
+
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+app = FastAPI(
+    title="Image Processing System",
+    description="Asynchronous image processing system for CSV files",
+    version="1.0.0"
+)
+
+# Add CORS middleware
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Initialize services
+image_processor = ImageProcessor()
+webhook_handler = WebhookHandler()
+
+@app.on_event("startup")
+async def startup():
+    """Initialize database connection"""
+    await database.connect()
+    logger.info("Database connected successfully")
+
+@app.on_event("shutdown")
+async def shutdown():
+    """Close database connection"""
+    await database.disconnect()
+    logger.info("Database disconnected")
+
+def validate_csv_format(df: pd.DataFrame) -> bool:
+    """Validate CSV format according to specifications"""
+    required_columns = ['S. No.', 'Product Name', 'Input Image Urls']
+   
+    # Check if all required columns exist
+    if not all(col in df.columns for col in required_columns):
+        return False
+   
+    # Check if data types are appropriate
+    for index, row in df.iterrows():
+        try:
+            # Validate serial number is numeric
+            int(row['S. No.'])
+           
+            # Validate product name is not empty
+            if pd.isna(row['Product Name']) or str(row['Product Name']).strip() == '':
+                return False
+           
+            # Validate image URLs format (comma-separated URLs)
+            urls = str(row['Input Image Urls']).split(',')
+            for url in urls:
+                url = url.strip()
+                if not url.startswith(('http://', 'https://')):
+                    return False
+                   
+        except (ValueError, AttributeError):
+            return False
+   
+    return True
+
+@app.post("/upload", response_model=RequestResponse)
+async def upload_csv(
+    file: UploadFile = File(...),
+    background_tasks: BackgroundTasks = None
+):
+    """
+    Upload CSV file and initiate asynchronous image processing
+   
+    Returns:
+        RequestResponse: Contains unique request ID for tracking
+    """
+    try:
+        # Validate file type
+        if not file.filename.endswith('.csv'):
+            raise HTTPException(status_code=400, detail="Only CSV files are allowed")
+       
+        # Generate unique request ID
+        request_id = str(uuid.uuid4())
+       
+        # Save uploaded file
+        upload_dir = "uploads"
+        os.makedirs(upload_dir, exist_ok=True)
+        file_path = os.path.join(upload_dir, f"{request_id}_{file.filename}")
+       
+        async with aiofiles.open(file_path, 'wb') as f:
+            content = await file.read()
+            await f.write(content)
+       
+        # Read and validate CSV
+        df = pd.read_csv(file_path)
+       
+        if not validate_csv_format(df):
+            raise HTTPException(
+                status_code=400,
+                detail="Invalid CSV format. Please check column names and data types."
+            )
+       
+        # Store request in database
+        query = requests_table.insert().values(
+            request_id=request_id,
+            filename=file.filename,
+            status=ProcessingStatus.PENDING.value,
+            total_images=sum(len(str(row['Input Image Urls']).split(',')) for _, row in df.iterrows()),
+            processed_images=0,
+            created_at=datetime.utcnow(),
+            file_path=file_path
+        )
+        await database.execute(query)
+       
+        # Start background processing
+        background_tasks.add_task(process_csv_async, request_id, file_path)
+       
+        logger.info(f"CSV uploaded successfully with request ID: {request_id}")
+       
+        return RequestResponse(
+            request_id=request_id,
+            message="CSV uploaded successfully. Processing started.",
+            status=ProcessingStatus.PENDING.value
+        )
+       
+    except Exception as e:
+        logger.error(f"Error uploading CSV: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/status/{request_id}", response_model=StatusResponse)
+async def get_status(request_id: str):
+    """
+    Check processing status for a given request ID
+   
+    Args:
+        request_id: Unique identifier for the processing request
+       
+    Returns:
+        StatusResponse: Current status and progress information
+    """
+    try:
+        # Query request status from database
+        query = requests_table.select().where(requests_table.c.request_id == request_id)
+        result = await database.fetch_one(query)
+       
+        if not result:
+            raise HTTPException(status_code=404, detail="Request ID not found")
+       
+        # Get products for this request
+        products_query = products_table.select().where(products_table.c.request_id == request_id)
+        products = await database.fetch_all(products_query)
+       
+        response = StatusResponse(
+            request_id=request_id,
+            status=result['status'],
+            total_images=result['total_images'],
+            processed_images=result['processed_images'],
+            created_at=result['created_at'],
+            updated_at=result['updated_at'],
+            output_csv_url=result['output_csv_path'] if result['status'] == ProcessingStatus.COMPLETED.value else None,
+            products=[{
+                'serial_number': p['serial_number'],
+                'product_name': p['product_name'],
+                'input_urls': p['input_urls'].split(',') if p['input_urls'] else [],
+                'output_urls': p['output_urls'].split(',') if p['output_urls'] else []
+            } for p in products]
+        )
+       
+        return response
+       
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error getting status for request {request_id}: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/webhook")
+async def webhook_endpoint(payload: dict):
+    """
+    Webhook endpoint for receiving processing completion notifications
+   
+    Args:
+        payload: Webhook payload containing request information
+    """
+    try:
+        await webhook_handler.handle_webhook(payload)
+        return {"message": "Webhook processed successfully"}
+    except Exception as e:
+        logger.error(f"Error processing webhook: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+async def process_csv_async(request_id: str, file_path: str):
+    """
+    Background task to process CSV file asynchronously
+   
+    Args:
+        request_id: Unique identifier for the request
+        file_path: Path to the uploaded CSV file
+    """
+    try:
+        # Update status to processing
+        await update_request_status(request_id, ProcessingStatus.PROCESSING.value)
+       
+        # Read CSV
+        df = pd.read_csv(file_path)
+       
+        # Process each row
+        processed_products = []
+        total_processed = 0
+       
+        for index, row in df.iterrows():
+            try:
+                serial_number = int(row['S. No.'])
+                product_name = str(row['Product Name']).strip()
+                input_urls = [url.strip() for url in str(row['Input Image Urls']).split(',')]
+               
+                # Process images for this product
+                output_urls = await image_processor.process_product_images(
+                    request_id, product_name, input_urls
+                )
+               
+                # Store product in database
+                product_query = products_table.insert().values(
+                    request_id=request_id,
+                    serial_number=serial_number,
+                    product_name=product_name,
+                    input_urls=','.join(input_urls),
+                    output_urls=','.join(output_urls)
+                )
+                await database.execute(product_query)
+               
+                processed_products.append({
+                    'S. No.': serial_number,
+                    'Product Name': product_name,
+                    'Input Image Urls': ','.join(input_urls),
+                    'Output Image Urls': ','.join(output_urls)
+                })
+               
+                total_processed += len(input_urls)
+               
+                # Update progress
+                await update_request_progress(request_id, total_processed)
+               
+            except Exception as e:
+                logger.error(f"Error processing product {product_name}: {str(e)}")
+                continue
+       
+        # Generate output CSV
+        output_csv_path = await generate_output_csv(request_id, processed_products)
+       
+        # Update status to completed
+        await update_request_status(
+            request_id,
+            ProcessingStatus.COMPLETED.value,
+            output_csv_path=output_csv_path
+        )
+       
+        # Trigger webhook
+        await webhook_handler.trigger_webhook({
+            'request_id': request_id,
+            'status': ProcessingStatus.COMPLETED.value,
+            'total_processed': total_processed,
+            'output_csv_url': output_csv_path
+        })
+       
+        logger.info(f"Processing completed for request {request_id}")
+       
+    except Exception as e:
+        logger.error(f"Error in background processing for request {request_id}: {str(e)}")
+        await update_request_status(request_id, ProcessingStatus.FAILED.value, error_message=str(e))
+
+async def update_request_status(request_id: str, status: str, output_csv_path: str = None, error_message: str = None):
+    """Update request status in database"""
+    values = {
+        'status': status,
+        'updated_at': datetime.utcnow()
+    }
+   
+    if output_csv_path:
+        values['output_csv_path'] = output_csv_path
+    if error_message:
+        values['error_message'] = error_message
+   
+    query = requests_table.update().where(
+        requests_table.c.request_id == request_id
+    ).values(**values)
+   
+    await database.execute(query)
+
+async def update_request_progress(request_id: str, processed_images: int):
+    """Update processing progress"""
+    query = requests_table.update().where(
+        requests_table.c.request_id == request_id
+    ).values(
+        processed_images=processed_images,
+        updated_at=datetime.utcnow()
+    )
+    await database.execute(query)
+
+async def generate_output_csv(request_id: str, products: List[dict]) -> str:
+    """Generate output CSV file with processed results"""
+    output_dir = "processed"
+    os.makedirs(output_dir, exist_ok=True)
+   
+    output_path = os.path.join(output_dir, f"{request_id}_output.csv")
+   
+    df = pd.DataFrame(products)
+    df.to_csv(output_path, index=False)
+   
+    return output_path
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)
